@@ -223,8 +223,6 @@ void displayThread(struct StreamContext * sc) {
 
 // SDL guarantees that this function will not be reentered.
 void audioCallback(void * userdata, Uint8 * const stream, int len) {
-	auto then = std::chrono::high_resolution_clock::now();
-	
 	StreamContext * sc = (StreamContext *)userdata;
 	RescaleContext * rc = (RescaleContext *)sc->opaque;
 	
@@ -514,9 +512,9 @@ int main(int argc, const char * argv[]) {
 		videoThread.join();
 	}
 	
-	//avformat_close_input(&_format);
+	avformat_close_input(&_format);
 	
-	//avformat_free_context(_format);
+	avformat_free_context(_format);
 	
     return 0;
 }
