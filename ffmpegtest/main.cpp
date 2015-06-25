@@ -7,25 +7,27 @@
 //
 
 #include <chrono>
+#include <condition_variable>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <queue>
 #include <string>
 #include <thread>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
-#include <libavutil/opt.h>
-#include <libavutil/time.h>
 #include <libavformat/avformat.h>
-#include <libswscale/swscale.h>
+#include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/time.h>
 #include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
 }
 
 #include <SDL.h>
 
-#define SDL_AUDIO_BUFFER_SIZE 1024 // In samples
+#define SDL_AUDIO_BUFFER_SIZE 2048 // In samples
 
 AVDictionary * _options = nullptr;
 
@@ -34,6 +36,10 @@ AVFormatContext * _format = nullptr;
 bool _running = true;
 
 //atomic<double> masterClock;
+
+#ifdef _WIN32
+#define constexpr const
+#endif
 
 template <typename T>
 struct isChronoDuration {
@@ -369,8 +375,10 @@ std::string ffmpegError(int errnum) {
 	return str;
 }
 
-int main(int argc, const char * argv[]) {
+int main(int argc, char * argv[]) {
 	std::thread videoThread;
+
+	SDL_Init(SDL_INIT_AUDIO);
 	
 	int err = 0;
 	
