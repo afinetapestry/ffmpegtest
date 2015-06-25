@@ -25,7 +25,7 @@ extern "C" {
 
 #include <SDL.h>
 
-#define SDL_AUDIO_BUFFER_SIZE 512 // In samples
+#define SDL_AUDIO_BUFFER_SIZE 1024 // In samples
 
 AVDictionary * _options = nullptr;
 
@@ -47,34 +47,75 @@ struct isChronoDuration<std::chrono::duration<Rep, Period>> {
 
 template <typename T>
 class TQueue {
+private:
+	std::queue<T> _queue;
+	std::mutex _mutex;
+	std::condition_variable _cond;
+	size_t _size;
+	
 public:
+	TQueue(size_t size = 4) : _size(size) {}
+	
+	void lock(std::unique_lock<decltype(_mutex)> & lock) {
+		lock = std::unique_lock<decltype(_mutex)>(_mutex);
+	}
+	
+	bool tryLock(std::unique_lock<decltype(_mutex)> & lock) {
+		lock = std::unique_lock<decltype(_mutex)>(_mutex, std::defer_lock);
+		return lock.try_lock();
+	}
+	
+	void unlock(std::unique_lock<decltype(_mutex)> & lock) {
+		lock.unlock();
+		_cond.notify_one();
+	}
+	
+	// Returns True if t is an item from the queue, False otherwise.
 	template <typename Duration = std::chrono::milliseconds, int duration_value = 250>
 	bool pop(T & t) {
 		static_assert(isChronoDuration<Duration>::value, "duration must be a std::chrono::duration");
 		
-		std::unique_lock<std::mutex> lock(_mutex);
+		std::unique_lock<decltype(_mutex)> lock(_mutex);
 		
 		while (_queue.empty()) {
 			if (!_running) {return false;}
 			_cond.wait_for(lock, Duration(duration_value));
 		}
 		
-		t = _queue.front();
-		_queue.pop();
+		bool p = pop(lock, t);
 		
 		lock.unlock();
 		_cond.notify_one();
 		
-		return true;
+		return p;
 	}
 	
 	template <typename Duration = std::chrono::milliseconds, int duration_value = 250>
-	bool push(const T & t, size_t size = 4) {
+	bool pop(std::unique_lock<decltype(_mutex)> & lock, T & t) {
 		static_assert(isChronoDuration<Duration>::value, "duration must be a std::chrono::duration");
 		
-		std::unique_lock<std::mutex> lock(_mutex);
+		if (!lock.owns_lock()) {
+			return false;
+		}
 		
-		while (_queue.size() > size) {
+		if (_queue.empty()) {
+			return false;
+		}
+		
+		t = _queue.front();
+		_queue.pop();
+		
+		return true;
+	}
+	
+	// Returns True is f was added to the queue, False otherwise
+	template <typename Duration = std::chrono::milliseconds, int duration_value = 250>
+	bool push(const T & t) {
+		static_assert(isChronoDuration<Duration>::value, "duration must be a std::chrono::duration");
+		
+		std::unique_lock<decltype(_mutex)> lock(_mutex);
+		
+		while (_queue.size() >= _size) {
 			if (!_running) {return false;}
 			_cond.wait_for(lock, Duration(duration_value));
 		}
@@ -86,11 +127,6 @@ public:
 		
 		return true;
 	}
-	
-private:
-	std::queue<T> _queue;
-	std::mutex _mutex;
-	std::condition_variable _cond;
 };
 
 struct StreamContext {
@@ -186,7 +222,9 @@ void displayThread(struct StreamContext * sc) {
 }
 
 // SDL guarantees that this function will not be reentered.
-void audioCallback(void * userdata, Uint8 * stream, int len) {
+void audioCallback(void * userdata, Uint8 * const stream, int len) {
+	auto then = std::chrono::high_resolution_clock::now();
+	
 	StreamContext * sc = (StreamContext *)userdata;
 	RescaleContext * rc = (RescaleContext *)sc->opaque;
 	
@@ -203,6 +241,11 @@ void audioCallback(void * userdata, Uint8 * stream, int len) {
 		return;
 	}
 	
+	std::unique_lock<std::mutex> lock;
+	if (!sc->_frameQueue->tryLock(lock)) {return;}
+	
+	// Leak boundary
+	
 	if (av_samples_alloc(&out, nullptr, rc->_channels, outSamples, rc->_sampleFormat, 1) < 0) {
 		std::cerr << "av_samples_alloc error\n";
 		return;
@@ -213,9 +256,9 @@ void audioCallback(void * userdata, Uint8 * stream, int len) {
 	while (outSamples > 0) {
 		AVFrame * f = nullptr;
 		
-		int64_t delay = swr_get_delay(rc->_swrContext, rc->_frequency); // Return the number of samples still buffered in the convert context.
-		if (delay < 1) { // No delay
-			if (!sc->_frameQueue->pop(f)) {return;}
+		int64_t delay = swr_get_delay(rc->_swrContext, rc->_frequency); // Return the number of samples (in output frequency) buffered in the convert context from last time.
+		if (delay < 1) { // No delay, get new frame
+			if (!sc->_frameQueue->pop(lock, f)) {break;} // No more frames in the queue, give up rather than waiting for more data.
 			in = f->data;
 			inSamples = f->nb_samples;
 		} else {
@@ -226,7 +269,7 @@ void audioCallback(void * userdata, Uint8 * stream, int len) {
 		int samples = swr_convert(rc->_swrContext, &index, outSamples, (const uint8_t **)in, inSamples);
 		if (samples < 0) { // Convert error
 			av_frame_free(&f);
-			return;
+			break;
 		}
 		outSamples -= samples;
 		index += samples * outSampleFactor;
@@ -234,7 +277,10 @@ void audioCallback(void * userdata, Uint8 * stream, int len) {
 		av_frame_free(&f); // Null checked internally.
 	}
 	
-	SDL_MixAudio(stream, out, len, SDL_MIX_MAXVOLUME * 1.0f);
+	sc->_frameQueue->unlock(lock);
+	
+	SDL_MixAudio(stream, out, (Uint32)(index - out), SDL_MIX_MAXVOLUME * 1.0f);
+	//memcpy(stream, out, index - out);
 	
 	av_freep(&out);
 }
@@ -381,6 +427,7 @@ int main(int argc, const char * argv[]) {
 		
 		if (avcodec_open2(codecContext, codec, nullptr) < 0) {
 			std::cerr << "Could not open video codec\n";
+			avcodec_close(codecContext);
 			continue;
 		}
 		
