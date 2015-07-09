@@ -6,6 +6,7 @@
 //  Copyright (c) 2015 Jonathan Hatchett. All rights reserved.
 //
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <iostream>
@@ -27,7 +28,7 @@ extern "C" {
 
 #include <SDL.h>
 
-#define SDL_AUDIO_BUFFER_SIZE 2048 // In samples
+#define SDL_AUDIO_BUFFER_SIZE 1024 // In samples
 
 AVDictionary * _options = nullptr;
 
@@ -35,9 +36,17 @@ AVFormatContext * _format = nullptr;
 
 bool _running = true;
 
-//atomic<double> masterClock;
+std::atomic<double> masterClock;
+std::atomic<double> masterClockTime;
 
-#ifdef _WIN32
+SDL_Window * window;
+SDL_Surface * screen;
+
+double getTime() {
+	return av_gettime() * 1e-6;
+}
+
+#ifndef constexpr
 #define constexpr const
 #endif
 
@@ -85,7 +94,7 @@ public:
 		
 		while (_queue.empty()) {
 			if (!_running) {return false;}
-			_cond.wait_for(lock, Duration(duration_value));
+			if (_cond.wait_for(lock, Duration(duration_value)) == std::cv_status::timeout) {return false;}
 		}
 		
 		bool p = pop(lock, t);
@@ -145,7 +154,7 @@ struct StreamContext {
 	
 	bool _enabled = false;
 	
-	void * opaque;
+	void * _opaque;
 	
 	std::thread _decodeThread;
 };
@@ -156,6 +165,15 @@ struct RescaleContext {
 	enum AVSampleFormat _sampleFormat;
 	int _frequency;
 	int _channels;
+};
+
+struct ScaleContext {
+	struct SwsContext * _swsContext;
+	
+	int _width;
+	int _height;
+	
+	int _stride[4];
 };
 
 std::map<int, struct StreamContext *> _contextMap;
@@ -206,31 +224,46 @@ void decodeThread(struct StreamContext * sc) {
 }
 
 void displayThread(struct StreamContext * sc) {
+	auto scale = (struct ScaleContext *)sc->_opaque;
+	
+	size_t sizeOfFrame = scale->_stride[0] * scale->_height;
+	
+	auto pic = (uint8_t *)malloc(sizeOfFrame);
+	if (pic == nullptr) {
+		throw std::runtime_error("malloc failed");
+	}
+	
 	while (_running) {
 		AVFrame * f;
 		if (!sc->_frameQueue->pop(f)) {continue;}
 		
-		/*static double lastPts = -1.0;
 		double base = av_q2d(sc->_stream->time_base);
-		double pts = av_frame_get_best_effort_timestamp(f) * base;
-		if (lastPts < 0.0) {lastPts = pts;}
-		double delay = pts + (pts - lastPts) - masterClock + f->repeat_pict * (base * 0.5);
-		lastPts = pts;
-		cout << delay << "\n";
-		if (delay > 0.1 * base) {
-			std::this_thread::sleep_for(chrono::duration<float>(delay));
-			
-			// Display picture
-		}*/
+		double pts = (av_frame_get_best_effort_timestamp(f) * base) + (f->repeat_pict * base * 0.5);
+		double delta = pts - masterClock + (getTime() - masterClockTime);
+		double deltaClamp = std::min(std::max(delta, 0.0), 1.0);
+		
+		std::cout << deltaClamp << "\n";
+		
+		std::this_thread::sleep_for(std::chrono::duration<float>(deltaClamp));
+		
+		sws_scale(scale->_swsContext, f->data, f->linesize, 0, f->height, &pic, &(scale->_stride[0]));
+		
+		auto surf = SDL_CreateRGBSurfaceFrom(pic, scale->_width, scale->_height, 24, scale->_stride[0], 0, 0, 0, 0);
+		
+		SDL_BlitSurface(surf, NULL, screen, NULL);
+		
+		SDL_FreeSurface(surf);
 		
 		av_frame_free(&f);
 	}
+	
+	free(pic);
 }
 
 // SDL guarantees that this function will not be reentered.
 void audioCallback(void * userdata, Uint8 * const stream, int len) {
 	StreamContext * sc = (StreamContext *)userdata;
-	RescaleContext * rc = (RescaleContext *)sc->opaque;
+	RescaleContext * rc = (RescaleContext *)sc->_opaque;
 	
 	memset(stream, 0, len);
 	
@@ -248,14 +281,15 @@ void audioCallback(void * userdata, Uint8 * const stream, int len) {
 	std::unique_lock<std::mutex> lock;
 	if (!sc->_frameQueue->tryLock(lock)) {return;}
 	
-	// Leak boundary
-	
 	if (av_samples_alloc(&out, nullptr, rc->_channels, outSamples, rc->_sampleFormat, 1) < 0) {
 		std::cerr << "av_samples_alloc error\n";
 		return;
 	}
 	
 	uint8_t * index = out;
+	
+	double pts = -1.0;
+	static double lastPts = 0.0;
 	
 	while (outSamples > 0) {
 		AVFrame * f = nullptr;
@@ -265,9 +299,28 @@ void audioCallback(void * userdata, Uint8 * const stream, int len) {
 			if (!sc->_frameQueue->pop(lock, f)) {break;} // No more frames in the queue, give up rather than waiting for more data.
 			in = f->data;
 			inSamples = f->nb_samples;
+			
+			double p = av_frame_get_best_effort_timestamp(f) * av_q2d(sc->_codecContext->time_base);
+			
+			if (pts < 0.0) {
+				pts = p;
+				
+				masterClock = pts;
+				masterClockTime = getTime();
+			}
+			
+			lastPts = p;
 		} else {
 			in = nullptr;
 			inSamples = 0;
+			
+			/*if (pts < 0.0) {
+				double d = ((double)delay / (double)rc->_frequency);
+				pts = lastPts + d;
+				
+				masterClock = pts;
+				masterClockTime = av_gettime() * 1e-6;
+			}*/
 		}
 		
 		int samples = swr_convert(rc->_swrContext, &index, outSamples, (const uint8_t **)in, inSamples);
@@ -322,6 +375,8 @@ AVSampleFormat SDLAudioFormatToAVSampleFormat(SDL_AudioFormat format) {
 }
 
 void audioSetup(struct StreamContext * sc) {
+	SDL_Init(SDL_INIT_AUDIO);
+	
 	SDL_AudioSpec wanted_spec, spec;
 	wanted_spec.freq =  sc->_stream->codec->sample_rate;
 	wanted_spec.format = AVSampleFormatToSDLAudioFormat(sc->_stream->codec->sample_fmt);
@@ -365,7 +420,27 @@ void audioSetup(struct StreamContext * sc) {
 	}
 	
 	rc->_swrContext = rescale;
-	sc->opaque = rc;
+	sc->_opaque = rc;
+}
+
+void videoSetup(struct StreamContext * sc) {
+	auto outputPixFmt = av_get_pix_fmt("bgr24");
+	auto outputPixFmtDesc = av_pix_fmt_desc_get(outputPixFmt);
+	
+	auto cc = sc->_codecContext;
+	
+	auto convert = sws_getContext(cc->width, cc->height, cc->pix_fmt, 1280, 720, outputPixFmt, SWS_BILINEAR, NULL, NULL, NULL);
+	if (convert == nullptr) {
+		throw std::runtime_error("sws_getContext error");
+	}
+	
+	struct ScaleContext * scale = new ScaleContext();
+	scale->_swsContext = convert;
+	scale->_width = cc->width;
+	scale->_height = cc->height;
+	scale->_stride[0] = cc->width * (outputPixFmtDesc->comp[0].step_minus1 + 1);
+	
+	sc->_opaque = scale;
 }
 
 std::string ffmpegError(int errnum) {
@@ -377,8 +452,15 @@ std::string ffmpegError(int errnum) {
 
 int main(int argc, char * argv[]) {
 	std::thread videoThread;
-
-	SDL_Init(SDL_INIT_AUDIO);
+	
+	SDL_Init(SDL_INIT_VIDEO);
+	
+	window = SDL_CreateWindow("VideoWindow", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 1280, 720, 0);
+	if (window == nullptr) {
+		std::cout << "Could not create window: " << SDL_GetError() << "\n";
+		return 1;
+	}
+	screen = SDL_GetWindowSurface(window);
 	
 	int err = 0;
 	
@@ -453,11 +535,13 @@ int main(int argc, char * argv[]) {
 		auto sc = i->second;
 		auto t = sc->_stream->codec->codec_type;
 		if (t == AVMEDIA_TYPE_VIDEO) {
+			videoSetup(sc);
+			
 			sc->_enabled = true; // Only enable decoding of audio and video streams for now.
 			
-			sc->_packetQueue = new TQueue<AVPacket *>();
-			sc->_frameQueue = new TQueue<AVFrame *>();
-			sc->_decodeThread = std::thread(decodeThread, sc); // Careful, cyclic.
+			sc->_packetQueue = new TQueue<AVPacket *>(32);
+			sc->_frameQueue = new TQueue<AVFrame *>(32);
+			sc->_decodeThread = std::thread(decodeThread, sc);
 			
 			videoThread = std::thread(displayThread, sc);
 		} else if (t == AVMEDIA_TYPE_AUDIO) {
@@ -465,9 +549,9 @@ int main(int argc, char * argv[]) {
 			
 			sc->_enabled = true; // Only enable decoding of audio and video streams for now.
 			
-			sc->_packetQueue = new TQueue<AVPacket *>();
-			sc->_frameQueue = new TQueue<AVFrame *>();
-			sc->_decodeThread = std::thread(decodeThread, sc); // Careful, cyclic.
+			sc->_packetQueue = new TQueue<AVPacket *>(32);
+			sc->_frameQueue = new TQueue<AVFrame *>(32);
+			sc->_decodeThread = std::thread(decodeThread, sc);
 		}
 	}
 	
@@ -475,7 +559,10 @@ int main(int argc, char * argv[]) {
 	
 	SDL_PauseAudio(0);
 	
-	while (av_read_frame(_format, packet) == 0) {
+	masterClock = 0.0;
+	masterClockTime = getTime();
+	
+	while (_running && av_read_frame(_format, packet) == 0) {
 		decltype(_contextMap)::const_iterator i;
 		if ((i = _contextMap.find(packet->stream_index)) != _contextMap.end()) {
 			if (i->second->_enabled) {
@@ -489,6 +576,17 @@ int main(int argc, char * argv[]) {
 		}
 		
 		// Seeking
+		
+		SDL_Event event;
+		while (SDL_PollEvent(&event)) {
+			switch (event.type) {
+				case SDL_QUIT:
+					_running = false;
+					break;
+			}
+		}
+		
+		SDL_UpdateWindowSurface(window);
 	}
 	
 	SDL_PauseAudio(1);
@@ -501,7 +599,11 @@ int main(int argc, char * argv[]) {
 		auto sc = i->second;
 		
 		if (sc->_stream->codec->codec_type == AVMEDIA_TYPE_AUDIO) {
-			auto rc = (struct RescaleContext *)sc->opaque;
+			auto scale = (struct ScaleContext *)sc->_opaque;
+			sws_freeContext(scale->_swsContext);
+			delete scale;
+		} else if (sc->_stream->codec->codec_type == AVMEDIA_TYPE_AUDIO) {
+			auto rc = (struct RescaleContext *)sc->_opaque;
 			swr_close(rc->_swrContext);
 			delete rc;
 		}
@@ -521,8 +623,10 @@ int main(int argc, char * argv[]) {
 	}
 	
 	avformat_close_input(&_format);
-	
 	avformat_free_context(_format);
+	
+	SDL_DestroyWindow(window);
+	SDL_Quit();
 	
     return 0;
 }

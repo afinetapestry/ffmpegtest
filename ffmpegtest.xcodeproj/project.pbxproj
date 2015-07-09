@@ -50,6 +50,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		F40C3DFB1B3C247600C9CFFB /* Readme.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = Readme.md; sourceTree = "<group>"; };
 		F41DD2231B2F09A4002CB4AB /* SDL2.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = SDL2.framework; sourceTree = "<group>"; };
 		F4940A2E1B29B24E0021A829 /* ffmpegtest */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = ffmpegtest; sourceTree = BUILT_PRODUCTS_DIR; };
 		F4940A311B29B24E0021A829 /* main.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = main.cpp; sourceTree = "<group>"; };
@@ -80,6 +81,7 @@
 		F4940A251B29B24E0021A829 = {
 			isa = PBXGroup;
 			children = (
+				F40C3DFB1B3C247600C9CFFB /* Readme.md */,
 				F4940A381B29B2C70021A829 /* Frameworks */,
 				F4940A301B29B24E0021A829 /* ffmpegtest */,
 				F4940A2F1B29B24E0021A829 /* Products */,
