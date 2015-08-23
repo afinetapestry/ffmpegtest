@@ -170,7 +170,7 @@ struct ScaleContext {
 	int _width;
 	int _height;
 	
-	int _stride[4];
+	int _stride[4] = {0, 0, 0, 0};
 };
 
 std::map<int, struct StreamContext *> _contextMap;
@@ -431,21 +431,25 @@ void audioSetup(struct StreamContext * sc) {
 }
 
 void videoSetup(struct StreamContext * sc) {
+	int width = 1280;
+	int height = 720;
+	
 	auto outputPixFmt = av_get_pix_fmt("bgr24");
 	auto outputPixFmtDesc = av_pix_fmt_desc_get(outputPixFmt);
 	
 	auto cc = sc->_codecContext;
 	
-	auto convert = sws_getContext(cc->width, cc->height, cc->pix_fmt, 1280, 720, outputPixFmt, SWS_BILINEAR, NULL, NULL, NULL);
+	auto convert = sws_getContext(cc->width, cc->height, cc->pix_fmt, width, height, outputPixFmt, SWS_BILINEAR, NULL, NULL, NULL);
 	if (convert == nullptr) {
 		throw std::runtime_error("sws_getContext error");
 	}
 	
 	struct ScaleContext * scale = new ScaleContext();
 	scale->_swsContext = convert;
-	scale->_width = cc->width;
-	scale->_height = cc->height;
-	scale->_stride[0] = cc->width * (outputPixFmtDesc->comp[0].step_minus1 + 1);
+	scale->_width = width;
+	scale->_height = height;
+	scale->_stride[0] = scale->_width * (outputPixFmtDesc->comp[0].step_minus1 + 1);
+	//scale->_stride[0] = cc->width * 3 * sizeof(uint8_t);
 	
 	sc->_opaque = scale;
 }
@@ -608,6 +612,7 @@ int main(int argc, char * argv[]) {
 	
 	auto scale = (struct ScaleContext *)videoSC->_opaque;
 	size_t sizeOfFrame = scale->_stride[0] * scale->_height;
+	//size_t sizeOfFrame = scale->_width * scale->_height * 3 * sizeof(uint8_t);
 	
 	auto pic = (uint8_t *)malloc(sizeOfFrame); // * 4 for AVI files??? What???
 	if (pic == nullptr) {
@@ -653,7 +658,7 @@ int main(int argc, char * argv[]) {
 		//std::this_thread::sleep_for(std::chrono::duration<float>(0.0417));
 		std::this_thread::sleep_for(std::chrono::duration<float>(0.1));
 		
-		if (sws_scale(scale->_swsContext, f->data, f->linesize, 0, f->height, &pic, &(scale->_stride[0])) < 0) {
+		if (sws_scale(scale->_swsContext, f->data, f->linesize, 0, f->height, &pic, scale->_stride) < 0) {
 			av_frame_free(&f);
 			continue;
 		}
@@ -667,6 +672,7 @@ int main(int argc, char * argv[]) {
 		av_frame_free(&f);
 		
 		SDL_UpdateWindowSurface(window);
+		//screen = SDL_GetWindowSurface(window);
 	}
 	
 	_running = false;
