@@ -7,6 +7,7 @@
 //
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <iostream>
@@ -35,19 +36,17 @@ AVDictionary * _options = nullptr;
 AVFormatContext * _format = nullptr;
 
 bool _running = true;
+bool _runningOnFumes = false;
 
 std::atomic<double> masterClock;
 std::atomic<double> masterClockTime;
-
-SDL_Window * window;
-SDL_Surface * screen;
 
 double getTime() {
 	return av_gettime() * 1e-6;
 }
 
-#ifndef constexpr
-#define constexpr const
+#ifdef _WIN32
+#define constexpr
 #endif
 
 template <typename T>
@@ -99,8 +98,7 @@ public:
 		
 		bool p = pop(lock, t);
 		
-		lock.unlock();
-		_cond.notify_one();
+		unlock(lock);
 		
 		return p;
 	}
@@ -137,8 +135,7 @@ public:
 		
 		_queue.push(t);
 		
-		lock.unlock();
-		_cond.notify_one();
+		unlock(lock);
 		
 		return true;
 	}
@@ -198,6 +195,7 @@ void decodeThread(struct StreamContext * sc) {
 		AVPacket * p;
 		
 		if (!sc->_packetQueue->pop(p)) {continue;}
+		assert(p->stream_index == sc->_stream->index);
 		
 		int frameAvailable = 1;
 		while (frameAvailable) { // Keep reading from the same packet so long as new frames are coming, keep going even when AVPacket::size == 0 but with AVPacket::data = nullptr to flush any buffers built by avcodec_decode_video2.
@@ -207,13 +205,18 @@ void decodeThread(struct StreamContext * sc) {
 			}
 			
 			if (frameAvailable) {
-				if (!sc->_frameQueue->push(f)) {frameAvailable = 0; continue;}
+				if (!sc->_frameQueue->push(f)) {
+					frameAvailable = 0; continue; // We're not running anymore, free the packet and frame and exit the thread.
+				}
 				f = allocFrame();
 			}
 			
 			p->data += read; // Keep updating the packet based on the last number of read bytes by the decoder.
 			p->size -= read;
-			if (p->size < 1) {p->data = nullptr;} // Set the data to nullptr when the packet is exausted to flush any buffers created.
+			/*if (p->size < 1) {
+				p->data = nullptr; // Set the data to nullptr when the packet is exausted to flush any buffers created.
+				//frameAvailable = 0;
+			}*/
 		}
 		
 		av_free_packet(p);
@@ -223,7 +226,7 @@ void decodeThread(struct StreamContext * sc) {
 	av_frame_free(&f);
 }
 
-void displayThread(struct StreamContext * sc) {
+/*void displayThread(struct StreamContext * sc) {
 	auto scale = (struct ScaleContext *)sc->_opaque;
 	
 	size_t sizeOfFrame = scale->_stride[0] * scale->_height;
@@ -258,7 +261,7 @@ void displayThread(struct StreamContext * sc) {
 	}
 	
 	free(pic);
-}
+}*/
 
 // SDL guarantees that this function will not be reentered.
 void audioCallback(void * userdata, Uint8 * const stream, int len) {
@@ -311,16 +314,18 @@ void audioCallback(void * userdata, Uint8 * const stream, int len) {
 			
 			lastPts = p;
 		} else {
+			// Retrieve buffered data from the rescale context
 			in = nullptr;
 			inSamples = 0;
 			
-			/*if (pts < 0.0) {
-				double d = ((double)delay / (double)rc->_frequency);
+			if (pts < 0.0) {
+				pts = 1.0;
+				/*double d = ((double)delay / (double)rc->_frequency);
 				pts = lastPts + d;
 				
 				masterClock = pts;
-				masterClockTime = av_gettime() * 1e-6;
-			}*/
+				masterClockTime = av_gettime() * 1e-6;*/
+			}
 		}
 		
 		int samples = swr_convert(rc->_swrContext, &index, outSamples, (const uint8_t **)in, inSamples);
@@ -360,7 +365,7 @@ SDL_AudioFormat AVSampleFormatToSDLAudioFormat(AVSampleFormat format) {
 			return AUDIO_F32SYS; break;
 		case AV_SAMPLE_FMT_NONE:
 		default:
-			throw std::runtime_error("Unknown sample format or no conversion available");
+			throw std::runtime_error("Unknown sample format or no conversion available"); break;
 	}
 }
 
@@ -377,16 +382,16 @@ AVSampleFormat SDLAudioFormatToAVSampleFormat(SDL_AudioFormat format) {
 void audioSetup(struct StreamContext * sc) {
 	SDL_Init(SDL_INIT_AUDIO);
 	
-	SDL_AudioSpec wanted_spec, spec;
-	wanted_spec.freq =  sc->_stream->codec->sample_rate;
-	wanted_spec.format = AVSampleFormatToSDLAudioFormat(sc->_stream->codec->sample_fmt);
-	wanted_spec.channels = sc->_stream->codec->channels;
-	wanted_spec.silence = 0;
-	wanted_spec.samples = SDL_AUDIO_BUFFER_SIZE;
-	wanted_spec.callback = audioCallback;
-	wanted_spec.userdata = sc;
+	SDL_AudioSpec wantedSpec, spec;
+	wantedSpec.freq =  sc->_stream->codec->sample_rate;
+	wantedSpec.format = AVSampleFormatToSDLAudioFormat(sc->_stream->codec->sample_fmt);
+	wantedSpec.channels = sc->_stream->codec->channels;
+	wantedSpec.silence = 0;
+	wantedSpec.samples = SDL_AUDIO_BUFFER_SIZE;
+	wantedSpec.callback = audioCallback;
+	wantedSpec.userdata = sc;
 	
-	if (SDL_OpenAudio(&wanted_spec, &spec) < 0) {
+	if (SDL_OpenAudio(&wantedSpec, &spec) < 0) {
 		std::cerr << "SDL_OpenAudio: " << SDL_GetError() << "\n";
 		return;
 	}
@@ -421,6 +426,8 @@ void audioSetup(struct StreamContext * sc) {
 	
 	rc->_swrContext = rescale;
 	sc->_opaque = rc;
+	
+	SDL_PauseAudio(0);
 }
 
 void videoSetup(struct StreamContext * sc) {
@@ -443,6 +450,30 @@ void videoSetup(struct StreamContext * sc) {
 	sc->_opaque = scale;
 }
 
+void readThread() {
+	AVPacket * packet = allocPacket();
+	
+	while (_running && av_read_frame(_format, packet) == 0) {
+		decltype(_contextMap)::const_iterator i;
+		if ((i = _contextMap.find(packet->stream_index)) != _contextMap.end()) {
+			if (i->second->_enabled) {
+				i->second->_packetQueue->push(packet);
+				packet = allocPacket();
+			} else {
+				av_free_packet(packet);
+			}
+		} else {
+			av_free_packet(packet);
+		}
+		
+		// seeking
+	}
+	
+	av_free(packet);
+	
+	_runningOnFumes = true;
+}
+
 std::string ffmpegError(int errnum) {
 	std::string str;
 	str.reserve(1024);
@@ -450,23 +481,40 @@ std::string ffmpegError(int errnum) {
 	return str;
 }
 
+int decode_video(AVCodecContext * avctx, AVFrame * picture, int * got_picture_ptr, const AVPacket * avpkt) {
+	if ((avpkt->size < 1 && // If the packet has no more data.
+		!_runningOnFumes) || // We're not running on fumes.
+		!(avctx->codec->capabilities | CODEC_CAP_DELAY)) { // The codec has no delay.
+		return -1; // Then we have nothing to get from this packet.
+	}
+	
+	int ret = avcodec_decode_video2(avctx, picture, got_picture_ptr, avpkt);
+	
+	if (_runningOnFumes && // We're running on fumes.
+		ret < 1) { // Less than one byte was taken from the packet.
+		_running = false; // The video stream has finished.
+	}
+	
+	return ret;
+}
+
 int main(int argc, char * argv[]) {
-	std::thread videoThread;
+	std::thread fileThread;
 	
 	SDL_Init(SDL_INIT_VIDEO);
 	
-	window = SDL_CreateWindow("VideoWindow", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 1280, 720, 0);
+	SDL_Window * window = SDL_CreateWindow("VideoWindow", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 1280, 720, 0);
 	if (window == nullptr) {
 		std::cout << "Could not create window: " << SDL_GetError() << "\n";
 		return 1;
 	}
-	screen = SDL_GetWindowSurface(window);
+	SDL_Surface * screen = SDL_GetWindowSurface(window);
 	
 	int err = 0;
 	
 	av_register_all();
 	
-	av_dict_set(&_options, "timeout", "100", 0);
+	av_dict_set(&_options, "timeout", "100", 0); // For network streams.
 	
 	if ((err = avformat_open_input(&_format, argv[1], nullptr, &_options)) < 0) {
 		std::cerr << "Error while calling avformat_open_input (probably invalid file format)" << "\n";
@@ -502,7 +550,7 @@ int main(int argc, char * argv[]) {
 				codecContext->extradata = istream->codec->extradata;
 				codecContext->extradata_size = istream->codec->extradata_size;
 				
-				decodeFunc = avcodec_decode_video2;
+				decodeFunc = decode_video;
 			} break;
 			case AVMEDIA_TYPE_AUDIO: {
 				codecContext->channels = 2; // Set some parameters.
@@ -529,6 +577,8 @@ int main(int argc, char * argv[]) {
 		_contextMap[istream->index] = streamContext;
 	}
 	
+	struct StreamContext * videoSC = nullptr;
+	
 	// After getting the information for all the streams make a choice as to which to decode, frequently the first video and audio stream.
 	// Also, create the audio device.
 	for (decltype(_contextMap)::iterator i = _contextMap.begin(); i != _contextMap.end(); ++i) {
@@ -537,70 +587,104 @@ int main(int argc, char * argv[]) {
 		if (t == AVMEDIA_TYPE_VIDEO) {
 			videoSetup(sc);
 			
-			sc->_enabled = true; // Only enable decoding of audio and video streams for now.
+			sc->_enabled = true;
 			
-			sc->_packetQueue = new TQueue<AVPacket *>(32);
-			sc->_frameQueue = new TQueue<AVFrame *>(32);
+			sc->_packetQueue = new TQueue<AVPacket *>(4);
+			sc->_frameQueue = new TQueue<AVFrame *>(4);
 			sc->_decodeThread = std::thread(decodeThread, sc);
 			
-			videoThread = std::thread(displayThread, sc);
+			//videoThread = std::thread(displayThread, sc);
+			videoSC = sc;
 		} else if (t == AVMEDIA_TYPE_AUDIO) {
 			audioSetup(sc);
 			
-			sc->_enabled = true; // Only enable decoding of audio and video streams for now.
+			//sc->_enabled = true;
 			
-			sc->_packetQueue = new TQueue<AVPacket *>(32);
-			sc->_frameQueue = new TQueue<AVFrame *>(32);
+			sc->_packetQueue = new TQueue<AVPacket *>(4);
+			sc->_frameQueue = new TQueue<AVFrame *>(4);
 			sc->_decodeThread = std::thread(decodeThread, sc);
 		}
 	}
 	
-	AVPacket * packet = allocPacket();
+	auto scale = (struct ScaleContext *)videoSC->_opaque;
+	size_t sizeOfFrame = scale->_stride[0] * scale->_height;
 	
-	SDL_PauseAudio(0);
+	auto pic = (uint8_t *)malloc(sizeOfFrame); // * 4 for AVI files??? What???
+	if (pic == nullptr) {
+		throw std::runtime_error("malloc failed");
+	}
 	
 	masterClock = 0.0;
 	masterClockTime = getTime();
 	
-	while (_running && av_read_frame(_format, packet) == 0) {
-		decltype(_contextMap)::const_iterator i;
-		if ((i = _contextMap.find(packet->stream_index)) != _contextMap.end()) {
-			if (i->second->_enabled) {
-				i->second->_packetQueue->push(packet);
-				packet = allocPacket();
-			} else {
-				av_free_packet(packet);
-			}
-		} else {
-			av_free_packet(packet);
-		}
-		
-		// Seeking
-		
+	fileThread = std::thread(readThread);
+	
+	while (_running) {
 		SDL_Event event;
 		while (SDL_PollEvent(&event)) {
 			switch (event.type) {
 				case SDL_QUIT:
 					_running = false;
 					break;
+				case SDL_KEYDOWN:
+					switch (event.key.keysym.sym) {
+						case SDLK_ESCAPE:
+							_running = false;
+							break;
+					}
+					break;
 			}
 		}
+		
+		AVFrame * f;
+		if (!videoSC->_frameQueue->pop(f)) {continue;}
+		
+		double base = av_q2d(videoSC->_stream->time_base);
+		double pts = (av_frame_get_best_effort_timestamp(f) * base) + (f->repeat_pict * base * 0.5);
+		double delta = (pts - masterClock) - (getTime() - masterClockTime);
+		double deltaClamp = std::min(std::max(delta, 0.0), 1.0);
+		
+		std::cout << f->pkt_pts << std::endl;
+		//std::cout << deltaClamp << "\n";
+		//static int64_t lastPts = -1; assert(f->pkt_pts > lastPts); lastPts = f->pkt_pts;
+		static double lastPts = -1; assert(pts > lastPts); lastPts = pts;
+		
+		//std::this_thread::sleep_for(std::chrono::duration<float>(deltaClamp));
+		//std::this_thread::sleep_for(std::chrono::duration<float>(0.0417));
+		std::this_thread::sleep_for(std::chrono::duration<float>(0.1));
+		
+		if (sws_scale(scale->_swsContext, f->data, f->linesize, 0, f->height, &pic, &(scale->_stride[0])) < 0) {
+			av_frame_free(&f);
+			continue;
+		}
+		
+		auto surf = SDL_CreateRGBSurfaceFrom(pic, scale->_width, scale->_height, 24, scale->_stride[0], 0, 0, 0, 0);
+		
+		SDL_BlitSurface(surf, NULL, screen, NULL);
+		
+		SDL_FreeSurface(surf);
+		
+		av_frame_free(&f);
 		
 		SDL_UpdateWindowSurface(window);
 	}
 	
+	_running = false;
+	
+	free(pic);
+	
 	SDL_PauseAudio(1);
 	
-	av_free(packet);
-	
-	_running = false;
+	if (fileThread.joinable()) {
+		fileThread.join();
+	}
 	
 	for (decltype(_contextMap)::iterator i = _contextMap.begin(); i != _contextMap.end(); ++i) {
 		auto sc = i->second;
 		
 		if (sc->_stream->codec->codec_type == AVMEDIA_TYPE_AUDIO) {
 			auto scale = (struct ScaleContext *)sc->_opaque;
-			sws_freeContext(scale->_swsContext);
+			//sws_freeContext(scale->_swsContext);
 			delete scale;
 		} else if (sc->_stream->codec->codec_type == AVMEDIA_TYPE_AUDIO) {
 			auto rc = (struct RescaleContext *)sc->_opaque;
@@ -618,12 +702,8 @@ int main(int argc, char * argv[]) {
 		delete sc;
 	}
 	
-	if (videoThread.joinable()) {
-		videoThread.join();
-	}
-	
-	avformat_close_input(&_format);
-	avformat_free_context(_format);
+	//avformat_close_input(&_format);
+	//avformat_free_context(_format);
 	
 	SDL_DestroyWindow(window);
 	SDL_Quit();
