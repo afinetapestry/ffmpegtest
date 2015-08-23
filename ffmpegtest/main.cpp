@@ -29,14 +29,13 @@ extern "C" {
 
 #include <SDL.h>
 
-#define SDL_AUDIO_BUFFER_SIZE 1024 // In samples
+#define SDL_AUDIO_BUFFER_SIZE 4096 // In samples
 
 AVDictionary * _options = nullptr;
 
 AVFormatContext * _format = nullptr;
 
 bool _running = true;
-bool _runningOnFumes = false;
 
 std::atomic<double> masterClock;
 std::atomic<double> masterClockTime;
@@ -170,7 +169,7 @@ struct ScaleContext {
 	int _width;
 	int _height;
 	
-	int _stride[4] = {0, 0, 0, 0};
+	int _stride[4];
 };
 
 std::map<int, struct StreamContext *> _contextMap;
@@ -191,32 +190,37 @@ AVFrame * allocFrame() {
 void decodeThread(struct StreamContext * sc) {
 	AVFrame * f = allocFrame();
 	
+	bool runningOnFumes = false;
+	
 	while (_running) {
 		AVPacket * p;
 		
 		if (!sc->_packetQueue->pop(p)) {continue;}
+		if (p->size < 1) {
+			runningOnFumes = true; // We've found our contexts running on fumes packet.
+		}
+		
 		assert(p->stream_index == sc->_stream->index);
 		
 		int frameAvailable = 1;
-		while (frameAvailable) { // Keep reading from the same packet so long as new frames are coming, keep going even when AVPacket::size == 0 but with AVPacket::data = nullptr to flush any buffers built by avcodec_decode_video2.
+		while (frameAvailable) {
 			int read = sc->_decodeFunc(sc->_codecContext, f, &frameAvailable, p);
-			if (read < 0) {
-				break; // Move on gracefully to next packet in the case of a decode error.
-			}
+			if (read < 0) {frameAvailable = 0; continue;} // Move on gracefully to next packet in the case of a decode error.
 			
 			if (frameAvailable) {
-				if (!sc->_frameQueue->push(f)) {
-					frameAvailable = 0; continue; // We're not running anymore, free the packet and frame and exit the thread.
-				}
+				if (!sc->_frameQueue->push(f)) {frameAvailable = 0; continue;} // We're not running anymore, free the packet and frame and exit the thread.
 				f = allocFrame();
 			}
 			
 			p->data += read; // Keep updating the packet based on the last number of read bytes by the decoder.
 			p->size -= read;
-			/*if (p->size < 1) {
-				p->data = nullptr; // Set the data to nullptr when the packet is exausted to flush any buffers created.
-				//frameAvailable = 0;
-			}*/
+			if (p->size < 1) {
+				if (runningOnFumes && sc->_codecContext->codec->capabilities | CODEC_CAP_DELAY) { // If we're running on fumes and the codec could have a delay.
+					p->data = nullptr; // Set the data to nullptr when the packet is exausted to flush any buffers created.
+				} else {
+					frameAvailable = 0; // Else move on to the next packet (without this we can force the decoder to spit out frames out of order which is not what we want).
+				}
+			}
 		}
 		
 		av_free_packet(p);
@@ -342,7 +346,6 @@ void audioCallback(void * userdata, Uint8 * const stream, int len) {
 	sc->_frameQueue->unlock(lock);
 	
 	SDL_MixAudio(stream, out, (Uint32)(index - out), SDL_MIX_MAXVOLUME * 1.0f);
-	//memcpy(stream, out, index - out);
 	
 	av_freep(&out);
 }
@@ -475,7 +478,15 @@ void readThread() {
 	
 	av_free(packet);
 	
-	_runningOnFumes = true;
+	// Send running on fumes packets to all enabled contexts.
+	for (decltype(_contextMap)::iterator i = _contextMap.begin(); i != _contextMap.end(); ++i) {
+		if (i->second->_enabled) {
+			packet = allocPacket();
+			packet->size = 0;
+			packet->data = nullptr;
+			i->second->_packetQueue->push(packet);
+		}
+	}
 }
 
 std::string ffmpegError(int errnum) {
@@ -485,7 +496,7 @@ std::string ffmpegError(int errnum) {
 	return str;
 }
 
-int decode_video(AVCodecContext * avctx, AVFrame * picture, int * got_picture_ptr, const AVPacket * avpkt) {
+/*int decode_video(AVCodecContext * avctx, AVFrame * picture, int * got_picture_ptr, const AVPacket * avpkt) {
 	if ((avpkt->size < 1 && // If the packet has no more data.
 		!_runningOnFumes) || // We're not running on fumes.
 		!(avctx->codec->capabilities | CODEC_CAP_DELAY)) { // The codec has no delay.
@@ -496,11 +507,11 @@ int decode_video(AVCodecContext * avctx, AVFrame * picture, int * got_picture_pt
 	
 	if (_runningOnFumes && // We're running on fumes.
 		ret < 1) { // Less than one byte was taken from the packet.
-		_running = false; // The video stream has finished.
+		//_running = false; // The video stream has finished.
 	}
 	
 	return ret;
-}
+}*/
 
 int main(int argc, char * argv[]) {
 	std::thread fileThread;
@@ -544,6 +555,8 @@ int main(int argc, char * argv[]) {
 			throw std::runtime_error("avcodec_alloc_context3 failed\n"); // This error is too fatal to recover from, out of memory assumed and will only cause further failures down the line.
 		}
 		
+		codecContext->refcounted_frames = 1; // Enabled frame reference counting (needed for queued frames).
+		
 		decltype(StreamContext::_decodeFunc) decodeFunc = nullptr;
 		
 		switch (istream->codec->codec_type) { // the type of data in this stream, notable values are AVMEDIA_TYPE_VIDEO and AVMEDIA_TYPE_AUDIO
@@ -554,7 +567,7 @@ int main(int argc, char * argv[]) {
 				codecContext->extradata = istream->codec->extradata;
 				codecContext->extradata_size = istream->codec->extradata_size;
 				
-				decodeFunc = decode_video;
+				decodeFunc = avcodec_decode_video2;
 			} break;
 			case AVMEDIA_TYPE_AUDIO: {
 				codecContext->channels = 2; // Set some parameters.
@@ -593,8 +606,8 @@ int main(int argc, char * argv[]) {
 			
 			sc->_enabled = true;
 			
-			sc->_packetQueue = new TQueue<AVPacket *>(4);
-			sc->_frameQueue = new TQueue<AVFrame *>(4);
+			sc->_packetQueue = new TQueue<AVPacket *>(32);
+			sc->_frameQueue = new TQueue<AVFrame *>(32);
 			sc->_decodeThread = std::thread(decodeThread, sc);
 			
 			//videoThread = std::thread(displayThread, sc);
@@ -602,19 +615,18 @@ int main(int argc, char * argv[]) {
 		} else if (t == AVMEDIA_TYPE_AUDIO) {
 			audioSetup(sc);
 			
-			//sc->_enabled = true;
+			sc->_enabled = true;
 			
-			sc->_packetQueue = new TQueue<AVPacket *>(4);
-			sc->_frameQueue = new TQueue<AVFrame *>(4);
+			sc->_packetQueue = new TQueue<AVPacket *>(32);
+			sc->_frameQueue = new TQueue<AVFrame *>(32);
 			sc->_decodeThread = std::thread(decodeThread, sc);
 		}
 	}
 	
 	auto scale = (struct ScaleContext *)videoSC->_opaque;
 	size_t sizeOfFrame = scale->_stride[0] * scale->_height;
-	//size_t sizeOfFrame = scale->_width * scale->_height * 3 * sizeof(uint8_t);
 	
-	auto pic = (uint8_t *)malloc(sizeOfFrame); // * 4 for AVI files??? What???
+	auto pic = (uint8_t *)malloc(sizeOfFrame);
 	if (pic == nullptr) {
 		throw std::runtime_error("malloc failed");
 	}
@@ -642,21 +654,16 @@ int main(int argc, char * argv[]) {
 		}
 		
 		AVFrame * f;
-		if (!videoSC->_frameQueue->pop(f)) {continue;}
+		if (!videoSC->_frameQueue->pop(f)) {
+			continue;
+		}
 		
 		double base = av_q2d(videoSC->_stream->time_base);
 		double pts = (av_frame_get_best_effort_timestamp(f) * base) + (f->repeat_pict * base * 0.5);
 		double delta = (pts - masterClock) - (getTime() - masterClockTime);
 		double deltaClamp = std::min(std::max(delta, 0.0), 1.0);
 		
-		std::cout << f->pkt_pts << std::endl;
-		//std::cout << deltaClamp << "\n";
-		//static int64_t lastPts = -1; assert(f->pkt_pts > lastPts); lastPts = f->pkt_pts;
-		static double lastPts = -1; assert(pts > lastPts); lastPts = pts;
-		
-		//std::this_thread::sleep_for(std::chrono::duration<float>(deltaClamp));
-		//std::this_thread::sleep_for(std::chrono::duration<float>(0.0417));
-		std::this_thread::sleep_for(std::chrono::duration<float>(0.1));
+		std::this_thread::sleep_for(std::chrono::duration<float>(deltaClamp));
 		
 		if (sws_scale(scale->_swsContext, f->data, f->linesize, 0, f->height, &pic, scale->_stride) < 0) {
 			av_frame_free(&f);
@@ -672,7 +679,6 @@ int main(int argc, char * argv[]) {
 		av_frame_free(&f);
 		
 		SDL_UpdateWindowSurface(window);
-		//screen = SDL_GetWindowSurface(window);
 	}
 	
 	_running = false;
