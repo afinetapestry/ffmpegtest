@@ -37,10 +37,10 @@ extern "C" {
 #include <SDL.h>
 
 #define SDL_AUDIO_BUFFER_SIZE 4096 // In samples
-#define AUDIO_PACKET_QUEUE_SIZE 1024
-#define AUDIO_FRAME_QUEUE_SIZE
-#define VIDEO_PACKET_QUEUE_SIZE 1024
-#define VIDEO_FRAME_QUEUE_SIZE 8
+#define AUDIO_PACKET_QUEUE_SIZE 32
+#define AUDIO_FRAME_QUEUE_SIZE 16
+#define VIDEO_PACKET_QUEUE_SIZE 32
+#define VIDEO_FRAME_QUEUE_SIZE 16
 
 AVDictionary * _options = nullptr;
 
@@ -50,7 +50,7 @@ bool _running = true;
 
 std::atomic<double> _masterClock;
 std::atomic<double> _masterClockTime;
-std::atomic<float> _seek{-1.0f};
+std::atomic<double> _seek{-999.0};
 
 double getTime() {
 	return av_gettime() * 1e-6;
@@ -233,7 +233,7 @@ void decodeThread(struct StreamContext * sc) {
 			p->size -= read;
 			if (p->size < 1) {
 				if (runningOnFumes && sc->_codecContext->codec->capabilities | CODEC_CAP_DELAY) { // If we're running on fumes and the codec could have a delay.
-					p->data = nullptr; // Set the data to nullptr when the packet is exausted to flush any buffers created.
+					p->data = NULL; // Set the data to null when the packet is exausted to flush any buffers created.
 				} else {
 					frameAvailable = 0; // Else move on to the next packet (without this we can force the decoder to spit out frames out of order which is not what we want).
 				}
@@ -270,7 +270,7 @@ void audioCallback(void * userdata, Uint8 * const stream, int len) {
 	std::unique_lock<std::mutex> lock;
 	if (!sc->_frameQueue->tryLock(lock)) {return;}
 	
-	if (av_samples_alloc(&out, nullptr, rc->_channels, outSamples, rc->_sampleFormat, 1) < 0) {
+	if (av_samples_alloc(&out, NULL, rc->_channels, outSamples, rc->_sampleFormat, 1) < 0) {
 		std::cerr << "av_samples_alloc error\n";
 		return;
 	}
@@ -289,13 +289,14 @@ void audioCallback(void * userdata, Uint8 * const stream, int len) {
 			in = f->data;
 			inSamples = f->nb_samples;
 			
-			double p = av_frame_get_best_effort_timestamp(f) * av_q2d(sc->_codecContext->time_base);
+			double base = av_q2d(sc->_stream->time_base);
+			double p = (av_frame_get_best_effort_timestamp(f) * base);
 			
 			if (pts < 0.0) {
 				pts = p;
 				
-				_masterClock = pts;
-				_masterClockTime = getTime();
+				_masterClock = pts; // The pts in float seconds of the first audio sample when this callback is complete.
+				_masterClockTime = getTime(); // The time in float seconds when this callback is complete.
 				
 				lastPts = p;
 			}
@@ -304,7 +305,9 @@ void audioCallback(void * userdata, Uint8 * const stream, int len) {
 			inSamples = 0;
 			
 			if (pts < 0.0) {
-				_masterClock = pts = lastPts + ((double)outSamples / (double)rc->_frequency);
+				pts = lastPts + ((double)outSamples / (double)rc->_frequency);
+				
+				_masterClock = pts;
 				_masterClockTime = getTime();
 				
 				lastPts = pts;
@@ -324,9 +327,11 @@ void audioCallback(void * userdata, Uint8 * const stream, int len) {
 	
 	sc->_frameQueue->unlock(lock);
 	
-	SDL_MixAudio(stream, out, (Uint32)(index - out), SDL_MIX_MAXVOLUME * 1.0f);
+	SDL_MixAudio(stream, out, (Uint32)(index - out), SDL_MIX_MAXVOLUME * 1.0);
 	
 	av_freep(&out);
+	
+	//std::cout << sc->_frameQueue->size() << ", " << sc->_packetQueue->size() << "\n";
 }
 
 SDL_AudioFormat AVSampleFormatToSDLAudioFormat(AVSampleFormat format) {
@@ -400,9 +405,8 @@ void audioSetup(struct StreamContext * sc) {
 		default: throw std::runtime_error("Cannot assume reasonable output channel layout."); break;
 	}
 	
-	auto rescale = swr_alloc_set_opts(nullptr, sc->_stream->codec->channel_layout, rc->_sampleFormat, sc->_stream->codec->sample_rate, sc->_stream->codec->channel_layout, sc->_stream->codec->sample_fmt, sc->_stream->codec->sample_rate, 0, nullptr);
-	int err = swr_init(rescale);
-	if (err) {
+	auto rescale = swr_alloc_set_opts(NULL, outChannelLayout, rc->_sampleFormat, rc->_frequency, sc->_stream->codec->channel_layout, sc->_stream->codec->sample_fmt, sc->_stream->codec->sample_rate, 0, NULL);
+	if (swr_init(rescale)) {
 		throw std::runtime_error("swr_init error");
 	}
 	
@@ -442,7 +446,7 @@ void flushContexts() {
 			AVPacket * packet = allocPacket();
 			packet->stream_index = i->second->_stream->index;
 			packet->size = 0;
-			packet->data = nullptr;
+			packet->data = NULL;
 			i->second->_packetQueue->push(packet);
 		}
 	}
@@ -464,9 +468,9 @@ void readThread() {
 			av_free_packet(packet);
 		}
 		
-		if (_seek >= 0.0f) {
+		if (_seek > -999.0) {
 			int flags = 0;
-			int64_t pos = std::max<int64_t>(_seek * AV_TIME_BASE, 1);
+			int64_t pos = std::max<int64_t>(_seek * AV_TIME_BASE, 0);
 			if (avformat_seek_file(_format, -1, 0, pos, pos + (AV_TIME_BASE / 10), flags) < 0) {
 				continue;
 			}
@@ -491,7 +495,7 @@ void readThread() {
 			
 			flushContexts();
 			
-			_seek = -1.0f;
+			_seek = -999.0;
 		}
 	}
 	
@@ -530,12 +534,12 @@ int main(int argc, char * argv[]) {
 	
 	av_dict_set(&_options, "timeout", "100", 0); // For network streams.
 	
-	if ((err = avformat_open_input(&_format, argv[1], nullptr, &_options)) < 0) {
+	if ((err = avformat_open_input(&_format, argv[1], NULL, &_options)) < 0) {
 		std::cerr << "Error while calling avformat_open_input (probably invalid file format)" << "\n";
 		return 1;
 	}
 	
-	if (avformat_find_stream_info(_format, nullptr) < 0) {
+	if (avformat_find_stream_info(_format, NULL) < 0) {
 		std::cerr << "Error while calling avformat_find_stream_info\n";
 		return 1;
 	}
@@ -581,7 +585,7 @@ int main(int argc, char * argv[]) {
 				break;
 		}
 		
-		if (avcodec_open2(codecContext, codec, nullptr) < 0) {
+		if (avcodec_open2(codecContext, codec, NULL) < 0) {
 			std::cerr << "Could not open video codec\n";
 			avcodec_free_context(&codecContext);
 			continue;
@@ -608,8 +612,8 @@ int main(int argc, char * argv[]) {
 			
 			sc->_enabled = true;
 			
-			sc->_packetQueue = new TQueue<AVPacket *>(AUDIO_PACKET_QUEUE_SIZE);
-			sc->_frameQueue = new TQueue<AVFrame *>(AUDIO_FRAME_QUEUE_SIZE);
+			sc->_packetQueue = new TQueue<AVPacket *>(VIDEO_PACKET_QUEUE_SIZE);
+			sc->_frameQueue = new TQueue<AVFrame *>(VIDEO_FRAME_QUEUE_SIZE);
 			sc->_decodeThread = std::thread(decodeThread, sc);
 			
 			videoSC = sc;
@@ -618,8 +622,8 @@ int main(int argc, char * argv[]) {
 			
 			sc->_enabled = true;
 			
-			sc->_packetQueue = new TQueue<AVPacket *>(VIDEO_PACKET_QUEUE_SIZE);
-			sc->_frameQueue = new TQueue<AVFrame *>(VIDEO_FRAME_QUEUE_SIZE);
+			sc->_packetQueue = new TQueue<AVPacket *>(AUDIO_PACKET_QUEUE_SIZE);
+			sc->_frameQueue = new TQueue<AVFrame *>(AUDIO_FRAME_QUEUE_SIZE);
 			sc->_decodeThread = std::thread(decodeThread, sc);
 		}
 	}
@@ -653,10 +657,10 @@ int main(int argc, char * argv[]) {
 							_running = false;
 							break;
 						case SDLK_LEFT:
-							_seek = _masterClock - 10.f;
+							_seek = _masterClock - 10.0;
 							break;
 						case SDLK_RIGHT:
-							_seek = _masterClock + 10.f;
+							_seek = _masterClock + 10.0;
 							break;
 					}
 					break;
@@ -674,12 +678,12 @@ int main(int argc, char * argv[]) {
 		}
 		
 		double base = av_q2d(videoSC->_stream->time_base);
-		double pts = (av_frame_get_best_effort_timestamp(f) * base) + (f->repeat_pict * base * 0.5);
+		double pts = (av_frame_get_best_effort_timestamp(f) * base);
 		double delta = (pts - _masterClock) - (getTime() - _masterClockTime);
 		double deltaClamp = std::min(std::max(delta, 0.0), 1.0);
 		
-		std::cout << delta << ", " << videoSC->_frameQueue->size() << ", " << videoSC->_packetQueue->size() << "\n";
-		std::this_thread::sleep_for(std::chrono::duration<float>(deltaClamp));
+		//std::cout << delta << ", " << videoSC->_frameQueue->size() << ", " << videoSC->_packetQueue->size() << "\n";
+		std::this_thread::sleep_for(std::chrono::duration<double>(deltaClamp));
 		
 		if (sws_scale(scale->_swsContext, f->data, f->linesize, 0, f->height, &pic, scale->_stride) < 0) {
 			av_frame_free(&f);
